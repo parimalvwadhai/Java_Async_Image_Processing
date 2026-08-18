@@ -12,6 +12,9 @@
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <junit.version>5.10.2</junit.version>
+        <!-- Run the sync-vs-async benchmark on startup:
+             .\mvnw.cmd javafx:run -Dapp.benchmark=true -->
+        <app.benchmark>false</app.benchmark>
     </properties>
 
     <dependencies>
@@ -142,6 +145,9 @@
                             <mainClass>
                                 com.image.imageprocessing/com.image.imageprocessing.HelloApplication
                             </mainClass>
+                            <options>
+                                <option>-Dapp.benchmark=${app.benchmark}</option>
+                            </options>
                             <launcher>app</launcher>
                             <jlinkZipName>app</jlinkZipName>
                             <jlinkImageName>app</jlinkImageName>

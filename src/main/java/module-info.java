@@ -1,4 +1,7 @@
 module com.image.imageprocessing {
+    // transitive: exported types (e.g. DrawMultipleImagesOnCanvas.createCanvas) expose
+    // javafx.graphics types such as Canvas and Stage in their public signatures.
+    requires transitive javafx.graphics;
     requires javafx.controls;
     requires javafx.fxml;
     requires javafx.web;

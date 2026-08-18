@@ -18,7 +18,9 @@ document covers that part.
 5. [Bug 3 — A singleton that was not a singleton](#bug-3--a-singleton-that-was-not-a-singleton)
 6. [Supporting fixes](#supporting-fixes)
 7. [Verification](#verification)
-8. [Open issues](#open-issues)
+8. [Measuring it: synchronous vs asynchronous](#measuring-it-synchronous-vs-asynchronous)
+9. [Bug 4 — Edge tiles silently dropped](#bug-4--edge-tiles-silently-dropped)
+10. [Open issues](#open-issues)
 
 ---
 
@@ -487,14 +489,187 @@ the tile size or introduce a deliberate delay inside the filter.
 
 ---
 
+## Measuring it: synchronous vs asynchronous
+
+The application ships both modes so the two can be compared directly. `ProcessingMode`
+controls **parallelism only** — not which thread the work runs on. Those are independent
+variables, and conflating them is precisely what made the original implementation impossible
+to reason about. Both `SYNCHRONOUS` and `ASYNCHRONOUS` are dispatched off the FX thread, so
+the difference between them isolates the speedup attributable to parallelism alone.
+
+Three interactive buttons plus a benchmark are exposed:
+
+| Control | Threads | Runs on | Demonstrates |
+|---|---|---|---|
+| Run Async | pool (= CPU count) | background | normal operation |
+| Run Sync | 1 | background | single-threaded baseline |
+| Run Sync on FX thread | 1 | **FX thread** | reproduces Bug 1 — the window freezes |
+| Benchmark both | both | background | warmed, repeated measurement |
+
+### A single run is not a measurement
+
+The first attempt at comparing the modes clicked each button once, on a freshly started JVM,
+and produced this:
+
+```
+Asynchronous (thread pool)    8 threads     597.2 ms
+Synchronous (single thread)   1 thread      664.3 ms
+```
+
+An apparent speedup of 1.11× on eight cores — and the numbers are meaningless. The
+asynchronous run happened to go **first**, so it absorbed the cost of JIT compilation and
+initial heap growth. Later warm single-threaded runs in the same session completed in ~305ms,
+roughly **twice as fast as the "faster" cold parallel run**.
+
+This is why the benchmark discards warm-up rounds and reports a distribution rather than a
+single figure. On the JVM, a one-shot timing measures the compiler as much as the code.
+
+### Results
+
+Run on 8 logical cores, 1920×1080 source, tile size 10 (20,736 tiles), 3 warm-up and 5
+measured runs per mode:
+
+```
+=== Benchmark: 3 warm-up + 5 measured runs per mode ===
+Synchronous (single thread)   1 thread   min  277.1  median  376.6  mean  384.1 ms
+Asynchronous (thread pool)    8 threads  min   97.1  median  172.1  mean  160.3 ms
+Speedup (median): 2.19x on 8 cores
+```
+
+Reproduce with:
+
+```powershell
+.\mvnw.cmd javafx:run "-Dapp.benchmark=true"
+```
+
+### Why it is 2.2×, not 8×
+
+The parallel path is unambiguously faster, but parallel efficiency is only about 27%. That
+gap is the interesting part, and it is explained by the workload rather than by the threading:
+
+- **Task granularity is far too fine.** Each of the 20,736 tasks filters a 10×10 tile — 100
+  pixels. Submission, `Future` bookkeeping, and queue contention are significant relative to
+  that much work. This is the single biggest lever, and it is still open.
+- **The workload is allocation-bound, not compute-bound.** `GreyScaleFilter` calls
+  `new Color(g, g, g)` **per pixel** — over two million short-lived objects per run — and each
+  tile additionally allocates an output `BufferedImage` and a `WritableImage`. Allocation and
+  garbage collection are shared resources; they do not scale with core count.
+- **Memory bandwidth is shared.** Copying pixels is memory-bound work, and memory bandwidth
+  does not multiply with cores the way arithmetic throughput does.
+- **The spread between min and median is GC noise.** Sync ranges 277–384ms and async 97–172ms
+  across five runs; collection pauses land unevenly across them.
+
+The honest summary: parallelism delivered a real ~2–3× improvement, and the remaining headroom
+is blocked by allocation behaviour and task granularity, not by the thread pool. Fixing
+`GreyScaleFilter` to write directly to the raster and coarsening the tiles would very likely
+move this number substantially — which is why both remain on the list below.
+
+---
+
+## Bug 4 — Edge tiles silently dropped
+
+Recorded separately from the three above because it is **not** a concurrency bug. It was found
+while reading the tiling loop during the same review, deferred as a known issue, and fixed
+afterwards.
+
+### The original code
+
+Both the sequential and parallel paths sized their grid with integer division:
+
+```java
+int numHorizontalImages = image.getWidth()  / num;
+int numVerticalImages   = image.getHeight() / num;
+
+for (int i = 0; i < numHorizontalImages; i++){
+    for (int j = 0; j < numVerticalImages; j++){
+        BufferedImage subImage = image.getSubimage(i*num, j*num, num, num);
+        ...
+    }
+}
+```
+
+### What happened
+
+Integer division truncates, so the grid stops short of the right and bottom edges whenever the
+tile size does not divide the dimension evenly. On a 1920×1080 source with tile size 64 the
+grid is 30 × 16 tiles, covering 1920×1024 — the bottom 56 rows are never filtered and never
+drawn. Since the canvas is cleared before each run, those pixels remain blank rather than
+merely unfiltered.
+
+The failure degrades sharply as tiles get coarser. A 101×97 image with tile size 100 produces a
+1 × 0 grid: no tiles at all, no output, no error.
+
+The defect was latent rather than visible. The bundled sample is 1920×1080 and the default tile
+size is 10, so the shipped configuration divides evenly and covers every pixel. Any other image
+— or the coarser tiling suggested by the performance notes above — would have exposed it.
+
+### The fix
+
+Ceiling division to size the grid, and a clamp on each tile's dimensions:
+
+```java
+int columns = Math.ceilDiv(image.getWidth(),  num);
+int rows    = Math.ceilDiv(image.getHeight(), num);
+```
+
+```java
+private static BufferedImage tileAt(BufferedImage image, int x, int y, int num){
+    int width  = Math.min(num, image.getWidth()  - x);
+    int height = Math.min(num, image.getHeight() - y);
+    return image.getSubimage(x, y, width, height);
+}
+```
+
+The two changes are a pair and must land together. Ceiling division alone yields a final column
+and row that begin inside the image but extend beyond it, and `getSubimage` throws
+`RasterFormatException` for a region outside the raster. The grid grows to reach the edge; the
+clamp keeps the last tile within it.
+
+`Math.ceilDiv(int, int)` was added in JDK 18. The older `(a + b - 1) / b` idiom is correct for
+positive operands but overflows near `Integer.MAX_VALUE`.
+
+### Consequences elsewhere
+
+With edge tiles clamped, a tile is no longer guaranteed to be `num × num`:
+
+- `ImageData` now carries `tile.getWidth()` / `tile.getHeight()` instead of `num` twice.
+- `GreyScaleFilter` required no change — it already derived its dimensions from its input.
+- `DrawMultipleImagesOnCanvas` required no change — it already drew each tile at the explicit
+  width and height carried on the tile.
+- The tile-count label in the UI shared the same integer-division assumption and would have
+  under-reported; it now uses `Math.ceilDiv` so the count matches the grid actually built.
+
+Only the producer needed modification, which supports the original producer/consumer split
+being sound even though the loop bounds within it were not.
+
+### Verification
+
+Off-by-one bounds are poorly suited to verification by inspection, so the tiling loop was
+extracted and executed against a coverage grid: an `int[height][width]` incremented once per
+pixel per tile, then checked for pixels covered zero times (the original bug) and pixels covered
+more than once (overlapping tiles, which would waste work and, with a non-idempotent filter,
+corrupt output). Testing only for gaps would pass a fix that overlapped.
+
+| Case | Grid | Result | Pixels dropped by the old loop |
+|---|---|---|---|
+| 1920×1080, tile 10 (default) | 192 × 108 | pass | 0 (0.00%) |
+| 1920×1080, tile 64 | 30 × 17 | pass | 107,520 (5.19%) |
+| 1000×1000, tile 3 | 334 × 334 | pass | 1,999 (0.20%) |
+| 101×97, tile 100 | 2 × 1 | pass | 9,797 (100%) |
+| 7×5, tile 1 | 7 × 5 | pass | 0 (0.00%) |
+
+### Takeaway
+
+The concurrency machinery surrounding this loop was correct throughout, and distributed the
+wrong set of tiles with complete reliability. A correct parallel decomposition still depends on
+correct sequential arithmetic; parallelism affects how fast a result arrives, not whether it is
+right.
+
+---
+
 ## Open issues
 
 Known and deliberately deferred, to keep the change set reviewable:
-
-- **Edge pixels are silently dropped.** Loop bounds use integer division (`width / num`), so a
-  1023px-wide image with tile size 10 yields 102 tiles covering 1020px — the rightmost 3 columns
-  are never processed or drawn. Requires ceiling division plus clamped edge tiles
-  (`Math.min(num, width - x)`).
 - **Task granularity is too fine.** `num` is the tile *size*, not a count, despite parameter
   names such as `numHorizontalImages`. Tile size 10 on a 1920×1080 image produces **20,736 tasks
   of 100 pixels each**, where submission and `Future` overhead likely dominate the actual work.
@@ -506,9 +681,6 @@ Known and deliberately deferred, to keep the change set reviewable:
   `WritableRaster.setSample` would address both.
 - **No backpressure.** The queue is unbounded; the producer can enqueue tens of thousands of
   tiles far faster than the consumer drains them.
-- **Canvas size is hardcoded** to 1920×1080 rather than sized to the loaded image.
-- **No synchronous mode.** The project's premise is a synchronous-versus-asynchronous comparison,
-  but only the asynchronous path exists, so there is currently no baseline to measure against.
 - **No test suite.** JUnit 5 is declared in `pom.xml`, but `src/test` does not exist. A useful
   first test would run two filters concurrently over one shared source image, exercising the
   purity invariant described above.

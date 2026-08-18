@@ -7,7 +7,6 @@ import com.image.imageprocessing.image.ImageData;
 import java.awt.image.BufferedImage;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -42,8 +41,9 @@ public class ImageProcessor {
      * (The application deliberately offers one control that violates this rule, in order to
      * demonstrate the resulting freeze.)
      *
-     * @param num tile size in pixels; must divide both image dimensions evenly, or the
-     *            remainder pixels along the right and bottom edges are silently skipped
+     * @param num tile size in pixels. It need not divide the image dimensions evenly — the
+     *            grid is sized by ceiling division and the tiles along the right and bottom
+     *            edges are clamped to whatever remains, so every pixel is covered exactly once
      * @return elapsed wall-clock time in nanoseconds
      */
     public long processImage(BufferedImage image, int num, ImageFilter imageFilter,
@@ -63,14 +63,14 @@ public class ImageProcessor {
      */
     private void processSequentially(BufferedImage image, int num, ImageFilter imageFilter,
                                      DrawMultipleImagesOnCanvas drawFn){
-        int numHorizontalImages = image.getWidth() / num;
-        int numVerticalImages = image.getHeight() / num;
+        int columns = Math.ceilDiv(image.getWidth(), num);
+        int rows = Math.ceilDiv(image.getHeight(), num);
 
-        for (int i = 0; i < numHorizontalImages; i++){
-            for (int j = 0; j < numVerticalImages; j++){
-                BufferedImage subImage = image.getSubimage(i*num, j*num, num, num);
-                BufferedImage result = imageFilter.filter(subImage);
-                drawFn.addImageToQueue(new ImageData(result, i*num, j*num, num, num));
+        for (int i = 0; i < columns; i++){
+            for (int j = 0; j < rows; j++){
+                int x = i * num;
+                int y = j * num;
+                filterAndPublish(tileAt(image, x, y, num), x, y, imageFilter, drawFn);
             }
         }
     }
@@ -78,30 +78,22 @@ public class ImageProcessor {
     /** Parallel path: one task per tile across the pool, then await them all. */
     private void processInParallel(BufferedImage image, int num, ImageFilter imageFilter,
                                    DrawMultipleImagesOnCanvas drawFn){
-        int numHorizontalImages = image.getWidth() / num;
-        int numVerticalImages = image.getHeight() / num;
+        int columns = Math.ceilDiv(image.getWidth(), num);
+        int rows = Math.ceilDiv(image.getHeight(), num);
 
         List<Future<ImageData>> futures = new ArrayList<>();
 
-        for (int i = 0; i<numHorizontalImages; i++){
-            for(int j=0; j<numVerticalImages; j++){
-                BufferedImage subImage = image.getSubimage(i*num, j*num, num, num);
-                int finalI = i;
-                int finalJ = j;
-                Future<ImageData> future = executorService.submit(new Callable<ImageData>() {
-                    @Override
-                    public ImageData call(){
-                        // Safe to read `subImage` concurrently: getSubimage aliases the
-                        // source raster rather than copying it, but ImageFilter is a pure
-                        // function that only reads the input and allocates a fresh output.
-                        BufferedImage result = imageFilter.filter(subImage);
-                        ImageData imageData = new ImageData(result, finalI *num, finalJ *num, num, num);
-                        // Add to queue immediately when processing is complete
-                        drawFn.addImageToQueue(imageData);
-                        return imageData;
-                    }
-                });
-                futures.add(future);
+        for (int i = 0; i < columns; i++){
+            for (int j = 0; j < rows; j++){
+                int x = i * num;
+                int y = j * num;
+                // The sub-image is carved on this thread, not inside the task, so the only
+                // thing the workers touch concurrently is the shared raster — and they only
+                // read it. Safe because ImageFilter is a pure function that allocates a
+                // fresh output rather than writing back into its input.
+                BufferedImage tile = tileAt(image, x, y, num);
+                futures.add(executorService.submit(
+                        () -> filterAndPublish(tile, x, y, imageFilter, drawFn)));
             }
         }
 
@@ -118,6 +110,39 @@ public class ImageProcessor {
                 return;
             }
         }
+    }
+
+    /**
+     * The tile whose top-left corner is ({@code x}, {@code y}), clamped so that a tile on the
+     * right or bottom edge never runs past the image bounds.
+     *
+     * <p>This clamp, together with the ceiling division that sizes the grid, is what stops the
+     * remainder strips from being dropped when the tile size does not divide the image evenly.
+     * Plain {@code width / num} produced a grid that stopped short, so up to {@code num - 1}
+     * columns and rows of pixels were never filtered <em>or</em> drawn — a silent correctness
+     * bug that only showed up as an unfiltered band on images whose dimensions happened not to
+     * be a multiple of the tile size.
+     */
+    private static BufferedImage tileAt(BufferedImage image, int x, int y, int num){
+        int width = Math.min(num, image.getWidth() - x);
+        int height = Math.min(num, image.getHeight() - y);
+        return image.getSubimage(x, y, width, height);
+    }
+
+    /**
+     * Filters one tile and publishes it to the consumer immediately, so the UI can draw it
+     * without waiting for the rest of the grid. Shared by both modes so that the work being
+     * timed is identical and the comparison stays honest.
+     *
+     * <p>The tile carries its own dimensions rather than assuming {@code num} square, because
+     * edge tiles are smaller.
+     */
+    private ImageData filterAndPublish(BufferedImage tile, int x, int y, ImageFilter imageFilter,
+                                       DrawMultipleImagesOnCanvas drawFn){
+        BufferedImage result = imageFilter.filter(tile);
+        ImageData imageData = new ImageData(result, x, y, tile.getWidth(), tile.getHeight());
+        drawFn.addImageToQueue(imageData);
+        return imageData;
     }
 
     /** Releases the pool. Call once the processor is no longer needed. */

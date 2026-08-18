@@ -110,8 +110,43 @@ packages are exported; `filter`, `io`, and `processor` are internal to the modul
 **From an IDE (IntelliJ IDEA / VS Code):** import the directory as a Maven project, set the
 project SDK to JDK 21, and run `com.image.imageprocessing.HelloApplication`.
 
-A window opens showing the bundled sample image rendered in greyscale, and the elapsed
-processing time is printed to the console on completion.
+A window opens with the sample image and four controls:
+
+| Control | Threads | Runs on | What it shows |
+|---|---|---|---|
+| **Run Async** | pool (= CPU count) | background | normal operation |
+| **Run Sync** | 1 | background | single-threaded baseline |
+| **Run Sync on FX thread** | 1 | **FX thread** | the window freezes until it finishes |
+| **Benchmark both** | both | background | warmed, repeated measurement |
+
+Sync and Async both run *off* the FX thread, so the only variable between them is
+parallelism — that comparison is a fair speedup number. The third button deliberately
+violates the rule, to show what blocking the UI thread looks like.
+
+### Benchmarking
+
+```powershell
+.\mvnw.cmd javafx:run "-Dapp.benchmark=true"
+```
+
+This runs the comparison at startup and prints it to stdout. It discards warm-up rounds and
+reports a distribution, because a single timing on a cold JVM measures the JIT compiler as
+much as the code — the first run of either mode is roughly twice as slow as a warm one.
+
+Sample result on 8 logical cores, 1920×1080 source, tile size 10 (20,736 tiles):
+
+```
+=== Benchmark: 3 warm-up + 5 measured runs per mode ===
+Synchronous (single thread)   1 thread   min  277.1  median  376.6  mean  384.1 ms
+Asynchronous (thread pool)    8 threads  min   97.1  median  172.1  mean  160.3 ms
+Speedup (median): 2.19x on 8 cores
+```
+
+Parallelism gives a real ~2–3× improvement, but well short of 8×. The remaining headroom is
+limited by the workload rather than the threading: 20,736 tasks of 100 pixels each is very
+fine granularity, and `GreyScaleFilter` allocates a `Color` object per pixel, making the run
+allocation-bound. Both are on the roadmap. The reasoning is worked through in the
+[Concurrency Design Notes](docs/CONCURRENCY.md).
 
 ---
 
@@ -138,21 +173,18 @@ public class SepiaFilter implements ImageFilter {
 
 Known and intentional, listed here so the scope is honest:
 
-- **Tile size must divide both image dimensions evenly.** Loop bounds use integer division, so
-  remainder pixels along the right and bottom edges are not processed or drawn.
 - **Fine tile granularity is inefficient.** The default tile size of 10px produces tens of
   thousands of very small tasks, where scheduling overhead is significant relative to the work.
 - **`GreyScaleFilter` is not optimised.** It uses per-pixel `getRGB`/`setRGB`, which routes
   through the `ColorModel` and is considerably slower than direct raster access.
 - **The queue is unbounded** — there is no backpressure if the producer outruns the consumer.
-- **Canvas size is fixed** at 1920×1080 rather than being sized to the loaded image.
 - **No test suite yet.** JUnit 5 is declared as a dependency but `src/test` does not exist.
 
 ## Roadmap
 
-- [ ] Synchronous single-threaded mode, for a like-for-like performance baseline
+- [x] Synchronous single-threaded mode, for a like-for-like performance baseline
+- [x] Correct edge-tile handling for arbitrary image dimensions
 - [ ] File chooser / CLI arguments instead of a bundled sample image
-- [ ] Correct edge-tile handling for arbitrary image dimensions
 - [ ] Write filtered output to disk (`ImageReadInf.sendImage` is currently a stub)
 - [ ] Additional filters — blur, sharpen, sepia
 - [ ] Raster-based fast path for `GreyScaleFilter`

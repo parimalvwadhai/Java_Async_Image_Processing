@@ -8,6 +8,7 @@ import com.image.imageprocessing.io.ImageReadInf;
 import com.image.imageprocessing.processor.ImageProcessor;
 import com.image.imageprocessing.processor.ProcessingMode;
 import javafx.application.Application;
+import javafx.application.Platform;
 import javafx.concurrent.Task;
 import javafx.geometry.Insets;
 import javafx.geometry.Rectangle2D;
@@ -26,6 +27,7 @@ import javafx.stage.Stage;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.Arrays;
 
 public class HelloApplication extends Application {
 
@@ -37,9 +39,14 @@ public class HelloApplication extends Application {
     private BufferedImage sourceImage;
     private ImageFilter imageFilter;
 
+    private static final int WARMUP_RUNS = 3;
+    private static final int MEASURED_RUNS = 5;
+    private static final int RESULTS_PANEL_HEIGHT = 170;
+
     private Button asyncButton;
     private Button syncButton;
     private Button syncOnFxButton;
+    private Button benchmarkButton;
     private Label statusLabel;
     private TextArea resultsLog;
 
@@ -55,9 +62,22 @@ public class HelloApplication extends Application {
         canvasView = new DrawMultipleImagesOnCanvas();
         Canvas canvas = canvasView.createCanvas(sourceImage.getWidth(), sourceImage.getHeight());
 
-        stage.setScene(new Scene(buildLayout(canvas)));
+        Rectangle2D screen = Screen.getPrimary().getVisualBounds();
+        Scene scene = new Scene(buildLayout(canvas), screen.getWidth(), screen.getHeight());
+
+        stage.setScene(scene);
         stage.setTitle("Image Processor — Sync vs Async Comparison");
+        // Maximise rather than size to content. The canvas is as large as the source image,
+        // so a content-sized window is typically taller than the display and pushes the
+        // results panel off-screen; maximising always fits the work area.
+        stage.setMaximized(true);
         stage.show();
+
+        // Scripted entry point: `mvnw javafx:run -Dapp.benchmark=true` runs the comparison
+        // automatically and prints it to stdout, with no clicking required.
+        if (Boolean.getBoolean("app.benchmark") || getParameters().getRaw().contains("--benchmark")) {
+            runBenchmark();
+        }
     }
 
     private BorderPane buildLayout(Canvas canvas){
@@ -70,19 +90,27 @@ public class HelloApplication extends Application {
         syncOnFxButton = new Button("Run Sync on FX thread (freezes UI)");
         syncOnFxButton.setOnAction(event -> runOnFxThread());
 
+        benchmarkButton = new Button("Benchmark both");
+        benchmarkButton.setDefaultButton(true);
+        benchmarkButton.setOnAction(event -> runBenchmark());
+
+        // Ceiling division, matching the grid ImageProcessor actually builds: a tile size that
+        // does not divide the image evenly still yields a (smaller) edge tile per remainder
+        // strip, so the count is one row and one column larger than integer division suggests.
         statusLabel = new Label(String.format(
                 "%d x %d, tile size %d = %,d tiles | pool size %d",
                 sourceImage.getWidth(), sourceImage.getHeight(), TILE_SIZE,
-                (sourceImage.getWidth() / TILE_SIZE) * (sourceImage.getHeight() / TILE_SIZE),
+                Math.ceilDiv(sourceImage.getWidth(), TILE_SIZE)
+                        * Math.ceilDiv(sourceImage.getHeight(), TILE_SIZE),
                 processor.getPoolSize()));
 
-        HBox controls = new HBox(10, asyncButton, syncButton, syncOnFxButton, statusLabel);
+        HBox controls = new HBox(10, asyncButton, syncButton, syncOnFxButton, benchmarkButton, statusLabel);
         controls.setPadding(new Insets(10));
 
         resultsLog = new TextArea();
         resultsLog.setEditable(false);
         resultsLog.setPrefRowCount(7);
-        resultsLog.setStyle("-fx-font-family: 'Consolas', monospace;");
+        resultsLog.setStyle("-fx-font-family: 'Consolas', monospace; -fx-control-inner-background: #f4f6f8;");
         resultsLog.setText("""
                 Run Sync first to establish a baseline, then Async to compare.
 
@@ -94,15 +122,22 @@ public class HelloApplication extends Application {
 
         ScrollPane canvasScroll = new ScrollPane(new Group(canvas));
         canvasScroll.setPannable(true);
+        // The canvas is as large as the source image, which gives the ScrollPane a large
+        // minimum height. Without this, BorderPane satisfies the centre region first and
+        // starves the results panel below it down to zero height.
+        canvasScroll.setMinSize(0, 0);
+        canvasScroll.setMaxHeight(Double.MAX_VALUE);
+        // Pin the results panel to a fixed height. Left to negotiate, BorderPane satisfies
+        // the centre region (whose content is a full-size image canvas) first and collapses
+        // this to nothing.
+        resultsLog.setMinHeight(RESULTS_PANEL_HEIGHT);
+        resultsLog.setPrefHeight(RESULTS_PANEL_HEIGHT);
+        resultsLog.setMaxHeight(RESULTS_PANEL_HEIGHT);
 
         BorderPane root = new BorderPane();
         root.setTop(controls);
         root.setCenter(canvasScroll);
         root.setBottom(resultsLog);
-
-        Rectangle2D screen = Screen.getPrimary().getVisualBounds();
-        root.setPrefSize(Math.min(1500, screen.getWidth() * 0.9),
-                         Math.min(950, screen.getHeight() * 0.9));
         return root;
     }
 
@@ -148,6 +183,91 @@ public class HelloApplication extends Application {
         finishRun();
     }
 
+    /**
+     * Runs both modes repeatedly and reports the distribution.
+     *
+     * <p>A single click of each button cannot produce a valid comparison: on a cold JVM the
+     * first run pays for JIT compilation and heap growth, so whichever mode happens to run
+     * first is penalised heavily. Measured directly after launch, a cold parallel run can
+     * look <em>slower</em> than a warm single-threaded one. Discarding warm-up rounds and
+     * reporting the median across several measured runs removes that artefact.
+     */
+    private void runBenchmark(){
+        setButtonsDisabled(true);
+
+        Task<Void> task = new Task<>() {
+            @Override
+            protected Void call() {
+                logLine("");
+                logLine(String.format("=== Benchmark: %d warm-up + %d measured runs per mode ===",
+                        WARMUP_RUNS, MEASURED_RUNS));
+
+                double[] sync = measure(ProcessingMode.SYNCHRONOUS);
+                double[] async = measure(ProcessingMode.ASYNCHRONOUS);
+
+                report(ProcessingMode.SYNCHRONOUS, 1, sync);
+                report(ProcessingMode.ASYNCHRONOUS, processor.getPoolSize(), async);
+                logLine(String.format("Speedup (median): %.2fx on %d cores",
+                        median(sync) / median(async), processor.getPoolSize()));
+                return null;
+            }
+
+            private double[] measure(ProcessingMode mode){
+                for (int i = 0; i < WARMUP_RUNS; i++) {
+                    processor.processImage(sourceImage, TILE_SIZE, imageFilter, canvasView, mode);
+                    discardBacklog();
+                }
+                double[] timings = new double[MEASURED_RUNS];
+                for (int i = 0; i < MEASURED_RUNS; i++) {
+                    timings[i] = processor.processImage(
+                            sourceImage, TILE_SIZE, imageFilter, canvasView, mode) / 1_000_000.0;
+                    discardBacklog();
+                }
+                return timings;
+            }
+
+            /**
+             * Drops tiles the consumer has not drawn yet. Without this the queue accumulates
+             * tens of thousands of images across runs, and the resulting GC pressure would
+             * itself distort the measurements.
+             */
+            private void discardBacklog(){
+                Platform.runLater(canvasView::clear);
+                try {
+                    Thread.sleep(120);
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            private void report(ProcessingMode mode, int threads, double[] timings){
+                double[] sorted = timings.clone();
+                Arrays.sort(sorted);
+                double mean = Arrays.stream(timings).average().orElse(Double.NaN);
+                logLine(String.format("%-28s %2d thread%s  min %7.1f  median %7.1f  mean %7.1f ms",
+                        mode.getLabel(), threads, threads == 1 ? " " : "s",
+                        sorted[0], median(timings), mean));
+            }
+
+            private double median(double[] values){
+                double[] sorted = values.clone();
+                Arrays.sort(sorted);
+                return sorted[sorted.length / 2];
+            }
+        };
+
+        task.setOnSucceeded(event -> finishRun());
+        task.setOnFailed(event -> {
+            task.getException().printStackTrace();
+            logLine("BENCHMARK FAILED: " + task.getException());
+            finishRun();
+        });
+
+        Thread thread = new Thread(task, "benchmark");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
     private void prepareRun(){
         canvasView.clear();
         setButtonsDisabled(true);
@@ -161,6 +281,7 @@ public class HelloApplication extends Application {
         asyncButton.setDisable(disabled);
         syncButton.setDisable(disabled);
         syncOnFxButton.setDisable(disabled);
+        benchmarkButton.setDisable(disabled);
     }
 
     private void logResult(ProcessingMode mode, long elapsedNanos, boolean onFxThread){
@@ -182,8 +303,17 @@ public class HelloApplication extends Application {
                 onFxThread ? "   [ON FX THREAD - UI was frozen]" : ""));
     }
 
+    /**
+     * Safe to call from any thread — the benchmark logs from its worker thread, and a
+     * TextArea may only be mutated on the FX Application Thread.
+     */
     private void logLine(String line){
-        resultsLog.appendText(line + System.lineSeparator());
+        System.out.println(line);
+        if (Platform.isFxApplicationThread()) {
+            resultsLog.appendText(line + System.lineSeparator());
+        } else {
+            Platform.runLater(() -> resultsLog.appendText(line + System.lineSeparator()));
+        }
     }
 
     private BufferedImage loadTestImage() throws IOException {
