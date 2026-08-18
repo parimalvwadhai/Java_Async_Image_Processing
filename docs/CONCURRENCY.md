@@ -671,6 +671,13 @@ At tile size 100 this yields an 11 × 8 grid whose final column is 23px wide and
 is 69px tall, and the rendered output reaches every edge. The previous loop produced a 10 × 7
 grid covering 1000×700, leaving an L-shaped band along the right and bottom edges undrawn.
 
+Both loops rendered over the same source, with magenta marking pixels no tile ever covered (on
+the live canvas they are simply never drawn, and stay blank):
+
+| Integer division — 10 × 7 grid, 70 tiles | `ceilDiv` + clamp — 11 × 8 grid, 88 tiles |
+|---|---|
+| ![Magenta band along the right and bottom edges where tiles were never drawn](images/edge-tiles-before.png) | ![Greyscale output reaching every edge](images/edge-tiles-after.png) |
+
 A coarse tile size is what makes the demonstration legible: the dropped strip can never exceed
 `num - 1` pixels, so at the default tile size of 10 the loss is under 10px — a significant part
 of why the defect went unnoticed.

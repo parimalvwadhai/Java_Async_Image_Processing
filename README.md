@@ -147,6 +147,23 @@ size, so at tile size 100 the grid is 11 × 8, with a final column 23px wide and
 69px tall. The tile dimensions are clamped to the image bounds, so those partial tiles are
 filtered and drawn like any other and the output is complete to the edge.
 
+#### What that guards against
+
+The tiling grid was originally sized with plain integer division, which silently discarded the
+remainder along the right and bottom edges. Both renders below are the same source at tile size
+100. Magenta marks pixels that no tile ever covered — on the live canvas they are simply never
+drawn, so they stay blank.
+
+| Integer division — 10 × 7 grid | `ceilDiv` + clamped tiles — 11 × 8 grid |
+|---|---|
+| ![Edge tiles dropped: magenta band along the right and bottom edges](docs/images/edge-tiles-before.png) | ![Edge tiles correct: greyscale to every edge](docs/images/edge-tiles-after.png) |
+| 70 tiles, covering 1000×700 of a 1023×769 image | 88 tiles, covering all of it |
+
+The dropped strip can never be wider than `tileSize - 1`, so at the default tile size of 10 the
+loss is under 10px — which is why a coarse tile is used here to make it legible. Worth noting
+that the parallel execution was equally correct in both cases: it distributed 70 tiles reliably
+in the first and 88 in the second. Correct concurrency does not imply a correct result.
+
 Quote the `-D` arguments in PowerShell. Unquoted, `-Dapp.tile=100` is mangled and Maven
 reports `Unknown lifecycle phase`.
 
