@@ -31,8 +31,23 @@ import java.util.Arrays;
 
 public class HelloApplication extends Application {
 
-    private static final String TEST_IMAGE = "/com/image/imageprocessing/io/test.jpg";
-    private static final int TILE_SIZE = 10;
+    private static final String DEFAULT_IMAGE = "/com/image/imageprocessing/io/test.jpg";
+
+    /**
+     * Both overridable at launch, so the edge-tile behaviour can be exercised without a code
+     * change. {@code test-odd.jpg} is 1023x769 — deliberately not a multiple of any round tile
+     * size — and a coarse tile makes the remainder strip large enough to see:
+     *
+     * <pre>
+     * .\mvnw.cmd javafx:run "-Dapp.image=/com/image/imageprocessing/io/test-odd.jpg" "-Dapp.tile=100"
+     * </pre>
+     *
+     * At tile size 100 that image yields an 11 x 8 grid whose last column is 23px wide and whose
+     * last row is 69px tall. Before the ceilDiv-and-clamp fix the grid was 10 x 7 and those two
+     * strips were never filtered or drawn.
+     */
+    private static final String TEST_IMAGE = System.getProperty("app.image", DEFAULT_IMAGE);
+    private static final int TILE_SIZE = Integer.getInteger("app.tile", 10);
 
     private ImageProcessor processor;
     private DrawMultipleImagesOnCanvas canvasView;

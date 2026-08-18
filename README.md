@@ -133,6 +133,23 @@ This runs the comparison at startup and prints it to stdout. It discards warm-up
 reports a distribution, because a single timing on a cold JVM measures the JIT compiler as
 much as the code — the first run of either mode is roughly twice as slow as a warm one.
 
+### Choosing the image and tile size
+
+```powershell
+.\mvnw.cmd javafx:run "-Dapp.image=/com/image/imageprocessing/io/test-odd.jpg" "-Dapp.tile=100"
+```
+
+`app.image` is a resource path on the module path and `app.tile` is the tile size in pixels.
+Two samples are bundled: `test.jpg` (1920×1080) and `test-odd.jpg` (1023×769).
+
+The second exists to exercise edge tiles. 1023 and 769 are not multiples of any round tile
+size, so at tile size 100 the grid is 11 × 8, with a final column 23px wide and a final row
+69px tall. The tile dimensions are clamped to the image bounds, so those partial tiles are
+filtered and drawn like any other and the output is complete to the edge.
+
+Quote the `-D` arguments in PowerShell. Unquoted, `-Dapp.tile=100` is mangled and Maven
+reports `Unknown lifecycle phase`.
+
 Sample result on 8 logical cores, 1920×1080 source, tile size 10 (20,736 tiles):
 
 ```

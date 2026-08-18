@@ -15,6 +15,11 @@
         <!-- Run the sync-vs-async benchmark on startup:
              .\mvnw.cmd javafx:run -Dapp.benchmark=true -->
         <app.benchmark>false</app.benchmark>
+        <!-- Source image and tile size, overridable on the command line. Use the 1023x769
+             sample with a coarse tile to exercise the clamped edge tiles:
+             .\mvnw.cmd javafx:run "-Dapp.image=/com/image/imageprocessing/io/test-odd.jpg" "-Dapp.tile=100" -->
+        <app.image>/com/image/imageprocessing/io/test.jpg</app.image>
+        <app.tile>10</app.tile>
     </properties>
 
     <dependencies>
@@ -147,6 +152,8 @@
                             </mainClass>
                             <options>
                                 <option>-Dapp.benchmark=${app.benchmark}</option>
+                                <option>-Dapp.image=${app.image}</option>
+                                <option>-Dapp.tile=${app.tile}</option>
                             </options>
                             <launcher>app</launcher>
                             <jlinkZipName>app</jlinkZipName>

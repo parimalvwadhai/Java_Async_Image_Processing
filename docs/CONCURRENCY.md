@@ -658,6 +658,23 @@ corrupt output). Testing only for gaps would pass a fix that overlapped.
 | 101×97, tile 100 | 2 × 1 | pass | 9,797 (100%) |
 | 7×5, tile 1 | 7 × 5 | pass | 0 (0.00%) |
 
+### Reproducing it visually
+
+A second sample, `test-odd.jpg`, ships at **1023×769** — dimensions chosen so that they are not
+a multiple of any round tile size. Both the image and the tile size are selectable at launch:
+
+```powershell
+.\mvnw.cmd javafx:run "-Dapp.image=/com/image/imageprocessing/io/test-odd.jpg" "-Dapp.tile=100"
+```
+
+At tile size 100 this yields an 11 × 8 grid whose final column is 23px wide and whose final row
+is 69px tall, and the rendered output reaches every edge. The previous loop produced a 10 × 7
+grid covering 1000×700, leaving an L-shaped band along the right and bottom edges undrawn.
+
+A coarse tile size is what makes the demonstration legible: the dropped strip can never exceed
+`num - 1` pixels, so at the default tile size of 10 the loss is under 10px — a significant part
+of why the defect went unnoticed.
+
 ### Takeaway
 
 The concurrency machinery surrounding this loop was correct throughout, and distributed the
