@@ -20,6 +20,9 @@
              .\mvnw.cmd javafx:run "-Dapp.image=/com/image/imageprocessing/io/test-odd.jpg" "-Dapp.tile=100" -->
         <app.image>/com/image/imageprocessing/io/test.jpg</app.image>
         <app.tile>10</app.tile>
+        <!-- Capacity of the bounded draw queue. Shrink it to make backpressure visible:
+             .\mvnw.cmd javafx:run "-Dapp.queue=16" -->
+        <app.queue>1024</app.queue>
     </properties>
 
     <dependencies>
@@ -119,6 +122,14 @@
             <version>${junit.version}</version>
             <scope>test</scope>
         </dependency>
+        <!-- @ParameterizedTest: the tiling tests are the same assertion over many
+             dimension/tile-size/mode combinations, which is exactly what it is for. -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-params</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
@@ -139,6 +150,20 @@
                 </configuration>
             </plugin>
             <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <!-- The main sources are a JPMS module, so Surefire would default to
+                         running the tests on the module path and patching them into
+                         com.image.imageprocessing. The tests need JUnit, which is not in the
+                         module's `requires` list, so that fails to resolve. Running them on
+                         the classpath instead keeps module-info.java honest about what the
+                         application needs, rather than adding test-only dependencies to it. -->
+                    <useModulePath>false</useModulePath>
+                </configuration>
+            </plugin>
+            <plugin>
                 <groupId>org.openjfx</groupId>
                 <artifactId>javafx-maven-plugin</artifactId>
                 <version>0.0.8</version>
@@ -154,6 +179,7 @@
                                 <option>-Dapp.benchmark=${app.benchmark}</option>
                                 <option>-Dapp.image=${app.image}</option>
                                 <option>-Dapp.tile=${app.tile}</option>
+                                <option>-Dapp.queue=${app.queue}</option>
                             </options>
                             <launcher>app</launcher>
                             <jlinkZipName>app</jlinkZipName>

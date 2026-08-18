@@ -45,13 +45,14 @@ HelloApplication.start()                       [JavaFX Application Thread]
                           |-- submits one Callable per tile to the pool
                           |         each task: filter(tile)
                           |                    -> ImageData
-                          |                    -> drawFn.addImageToQueue()
+                          |                    -> drawFn.accept()   [TileSink]
                           |                         (converts to FX Image here,
                           |                          on the worker thread)
                           '-- blocks on future.get()  <-- safe: not the FX thread
                                         |
                                         v
-                              ConcurrentLinkedQueue<Tile>   <-- thread-safety boundary
+                       bounded LinkedBlockingQueue<Tile>   <-- thread-safety boundary
+                         producers put() and block when full  (backpressure)
                                         |
                                         v
                               AnimationTimer.handle()  ->  gc.drawImage()
@@ -288,7 +289,7 @@ offloaded the trivial part and retained the expensive part on the UI thread.
 
 ### The fix
 
-The conversion moved into `addImageToQueue()`, which is invoked from inside the `Callable` and
+The conversion moved into `accept()`, which is invoked from inside the `Callable` and
 therefore already runs on a pool worker. The pixel copy lands where the parallelism is, and the
 FX thread is left with only `drawImage`:
 
@@ -296,9 +297,10 @@ FX thread is left with only `drawImage`:
 private record Tile(Image image, int x, int y, int width, int height) { }
 
 /** Called from pool worker threads. Converts off the FX thread, then publishes. */
-public void addImageToQueue(ImageData image){
+@Override
+public void accept(ImageData image){
     Image fxImage = SwingFXUtils.toFXImage(image.getImage(), null);
-    queue.offer(new Tile(fxImage, image.getI(), image.getJ(), image.getX(), image.getY()));
+    queue.put(new Tile(fxImage, image.getI(), image.getJ(), image.getX(), image.getY()));
 }
 ```
 
@@ -325,12 +327,47 @@ FX thread again — recreating Bug 1 at a smaller scale. Bounding work per frame
 rate smooth while still making steady progress, and checking the deadline *after* drawing
 guarantees at least one tile advances per frame.
 
-### Queue choice
+### Queue choice — and why it was revisited
 
-`ConcurrentLinkedQueue` replaced `LinkedBlockingQueue`. The blocking API was never used — the
-consumer is a non-blocking `poll()` drain — so the lock-free queue, with no lock and no capacity
-bookkeeping, is the better fit. The trade-off is the loss of backpressure; see
-[Open issues](#open-issues).
+The first decision was to replace `LinkedBlockingQueue` with `ConcurrentLinkedQueue`. The
+reasoning was that the blocking API was never used — the consumer is a non-blocking `poll()`
+drain — so a lock-free queue with no lock and no capacity bookkeeping was the better fit. That
+reasoning was sound as far as it went, and it went one step short: an unbounded queue means a
+fast producer with a slow consumer simply grows the heap, and there is no mechanism to stop it.
+
+The queue is now a **bounded `LinkedBlockingQueue`**, and producers `put()`. When it is full, a
+worker blocks until the consumer makes space. That is backpressure: the consumer's rate reaches
+the producers instead of being absorbed by memory, and a blocked worker is idle rather than
+allocating — which is what should happen when the drawing side cannot keep up.
+
+The blocking is deliberately **asymmetric**, and that asymmetry is the design:
+
+| Side | Operation | May block? |
+|---|---|---|
+| Producers (pool workers) | `put()` | Yes — this is the backpressure |
+| Consumer (FX thread) | `poll()` | **Never** — blocking it is the failure this whole design exists to prevent |
+
+The cost is a lock where there previously was none, and one that is now contended by every
+worker. At these tile counts it does not show up against the per-tile filtering and pixel
+conversion, but it is a real trade and worth naming: lock-free throughput was exchanged for a
+bound on memory.
+
+#### The deadlock this introduced
+
+Bounding the queue turned the deliberately-wrong "Run Sync on FX thread" control into a genuine
+deadlock, where before it was only a freeze. The distinction is worth being precise about,
+because the two are commonly conflated:
+
+- **Before (unbounded):** the FX thread is *busy* inside the processing loop, so
+  `AnimationTimer` never fires and nothing paints. Unresponsive, but it always completes. This
+  is starvation of the event loop.
+- **After (bounded):** the FX thread blocks in `put()` waiting for space — and it is also the
+  only thread that drains the queue. The space can never appear, because the thread that would
+  create it is the one waiting. A circular wait with a cycle length of one.
+
+`accept()` therefore checks `Platform.isFxApplicationThread()`, and on that path uses a timed
+`offer` that throws `SelfDeadlockException` rather than a `put` that would hang the JVM. The
+failure names itself and the window survives.
 
 The per-tile `System.out.println` calls were also removed. Roughly 20,000 synchronised writes to
 `System.out` is a measurable bottleneck in its own right and would distort any timing measurement.
@@ -531,9 +568,10 @@ measured runs per mode:
 
 ```
 === Benchmark: 3 warm-up + 5 measured runs per mode ===
-Synchronous (single thread)   1 thread   min  277.1  median  376.6  mean  384.1 ms
-Asynchronous (thread pool)    8 threads  min   97.1  median  172.1  mean  160.3 ms
-Speedup (median): 2.19x on 8 cores
+(measuring the processing pipeline only - tiles are counted, not drawn)
+Synchronous (single thread)   1 thread   min   135.3  median   145.9  mean   163.4 ms
+Asynchronous (thread pool)    8 threads  min    56.8  median    62.6  mean    68.6 ms
+Speedup (median): 2.33x on 8 cores
 ```
 
 Reproduce with:
@@ -542,7 +580,21 @@ Reproduce with:
 .\mvnw.cmd javafx:run "-Dapp.benchmark=true"
 ```
 
-### Why it is 2.2×, not 8×
+#### What the consumer had to be changed to
+
+An earlier version of this benchmark drew every tile to the canvas, and reported 376.6ms sync
+against 172.1ms async — **2.19×**. Bounding the queue made that measurement invalid: once
+producers block on a full queue, a run that feeds the canvas is limited by how fast the FX
+thread drains, and because both modes share one consumer, the ratio would converge on the
+consumer's rate no matter how much parallelism the producers achieved. The benchmark now
+publishes to a counting sink that cannot be a bottleneck.
+
+That change is also a small piece of evidence in its own right. Removing `toFXImage` from the
+measured path cut both absolute figures by more than half but moved the *ratio* by almost
+nothing, 2.19× to 2.33×. Had pixel conversion been the constraint, taking it out would have
+changed the ratio. It didn't, so it wasn't.
+
+### Why it is 2.3×, not 8×
 
 The parallel path is unambiguously faster, but parallel efficiency is only about 27%. That
 gap is the interesting part, and it is explained by the workload rather than by the threading:
@@ -696,16 +748,21 @@ right.
 Known and deliberately deferred, to keep the change set reviewable:
 - **Task granularity is too fine.** `num` is the tile *size*, not a count, despite parameter
   names such as `numHorizontalImages`. Tile size 10 on a 1920×1080 image produces **20,736 tasks
-  of 100 pixels each**, where submission and `Future` overhead likely dominate the actual work.
-  Coarser tiles — row bands, or 256×256 — would amortise coordination cost.
+  of 100 pixels each**, where submission and `Future` overhead dominate the actual work.
+  **Now measured rather than suspected:** holding the image, the filter and the total pixel
+  work constant and varying only tile size gives 2.33× at tile 10, 3.25× at 50, 5.57× at 100,
+  and 4.71× at 240 — the parallel path alone improving from 62.6ms to 37.1ms. The fall-off at
+  240 is load imbalance, only 40 tasks across 8 threads. The default of 10 is kept because
+  small tiles are what makes progressive rendering visible, which is the demo's purpose.
 - **`GreyScaleFilter` is slow and subtly incorrect.** Per-pixel `getRGB`/`setRGB` route through
   the `ColorModel`; `new Color(g,g,g)` allocates an object per pixel; and writing an sRGB value
-  into a `TYPE_BYTE_GRAY` image triggers a colour-space conversion that applies gamma, so the
-  stored value differs from the computed luminance. Direct raster access via
-  `WritableRaster.setSample` would address both.
-- **No backpressure.** The queue is unbounded; the producer can enqueue tens of thousands of
-  tiles far faster than the consumer drains them.
-- **No test suite.** JUnit 5 is declared in `pom.xml`, but `src/test` does not exist. A useful
-  first test would run two filters concurrently over one shared source image, exercising the
-  purity invariant described above.
+  into a `TYPE_BYTE_GRAY` image, whose colour space is linear, applies a gamma conversion. The
+  byte actually stored bears little resemblance to the computed luminance: 54 is stored as 9,
+  128 as 55, 255 as 253. `getRGB` converts back on the way out, which is why the rendered
+  output looks correct and the defect is invisible without reading the raster directly.
+
+  Note that direct raster access is **not** on its own the fix: writing 54 into the raster
+  would make `getRGB` report about 136, a visibly brighter image. The output type has to move
+  to a packed sRGB type such as `TYPE_INT_RGB`, which removes the colour-model conversion and
+  the per-pixel allocation together.
 - **`sendImage()` is an unimplemented stub** — filtered output is never written to disk.

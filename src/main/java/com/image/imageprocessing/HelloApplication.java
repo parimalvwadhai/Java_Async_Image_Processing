@@ -3,6 +3,9 @@ package com.image.imageprocessing;
 import com.image.imageprocessing.filter.GreyScaleFilter;
 import com.image.imageprocessing.filter.ImageFilter;
 import com.image.imageprocessing.image.DrawMultipleImagesOnCanvas;
+import com.image.imageprocessing.image.ImageData;
+import com.image.imageprocessing.image.SelfDeadlockException;
+import com.image.imageprocessing.image.TileSink;
 import com.image.imageprocessing.io.FileImageIO;
 import com.image.imageprocessing.io.ImageReadInf;
 import com.image.imageprocessing.processor.ImageProcessor;
@@ -28,6 +31,7 @@ import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class HelloApplication extends Application {
 
@@ -192,10 +196,18 @@ public class HelloApplication extends Application {
      */
     private void runOnFxThread(){
         prepareRun();
-        long elapsed = processor.processImage(
-                sourceImage, TILE_SIZE, imageFilter, canvasView, ProcessingMode.SYNCHRONOUS);
-        logResult(ProcessingMode.SYNCHRONOUS, elapsed, true);
-        finishRun();
+        try {
+            long elapsed = processor.processImage(
+                    sourceImage, TILE_SIZE, imageFilter, canvasView, ProcessingMode.SYNCHRONOUS);
+            logResult(ProcessingMode.SYNCHRONOUS, elapsed, true);
+        } catch (SelfDeadlockException ex) {
+            // Reached once the bounded queue fills: this thread is blocked publishing, and it
+            // is also the only thread that drains. The queue turned a freeze that always ends
+            // into a circular wait that never would.
+            logLine("DEADLOCK: " + ex.getMessage());
+        } finally {
+            finishRun();
+        }
     }
 
     /**
@@ -206,9 +218,18 @@ public class HelloApplication extends Application {
      * first is penalised heavily. Measured directly after launch, a cold parallel run can
      * look <em>slower</em> than a warm single-threaded one. Discarding warm-up rounds and
      * reporting the median across several measured runs removes that artefact.
+     *
+     * <p>The benchmark publishes to a {@link CountingSink} rather than to the canvas, so it
+     * measures the <em>processing</em> pipeline alone. This became necessary when the draw
+     * queue was bounded: with backpressure, a run that feeds the canvas is limited by how fast
+     * the FX thread drains, and since both modes share one consumer the comparison would
+     * converge on the consumer's rate and report a speedup near 1x regardless of how much
+     * parallelism the producers actually achieved. Measuring against a sink that cannot be a
+     * bottleneck keeps the number a statement about the thread pool.
      */
     private void runBenchmark(){
         setButtonsDisabled(true);
+        canvasView.clear();
 
         Task<Void> task = new Task<>() {
             @Override
@@ -216,6 +237,9 @@ public class HelloApplication extends Application {
                 logLine("");
                 logLine(String.format("=== Benchmark: %d warm-up + %d measured runs per mode ===",
                         WARMUP_RUNS, MEASURED_RUNS));
+                // ASCII only: this line is also written to stdout, where a non-UTF-8 console
+                // codepage mangles anything outside it.
+                logLine("(measuring the processing pipeline only - tiles are counted, not drawn)");
 
                 double[] sync = measure(ProcessingMode.SYNCHRONOUS);
                 double[] async = measure(ProcessingMode.ASYNCHRONOUS);
@@ -228,31 +252,26 @@ public class HelloApplication extends Application {
             }
 
             private double[] measure(ProcessingMode mode){
+                CountingSink sink = new CountingSink();
                 for (int i = 0; i < WARMUP_RUNS; i++) {
-                    processor.processImage(sourceImage, TILE_SIZE, imageFilter, canvasView, mode);
-                    discardBacklog();
+                    processor.processImage(sourceImage, TILE_SIZE, imageFilter, sink, mode);
                 }
                 double[] timings = new double[MEASURED_RUNS];
                 for (int i = 0; i < MEASURED_RUNS; i++) {
                     timings[i] = processor.processImage(
-                            sourceImage, TILE_SIZE, imageFilter, canvasView, mode) / 1_000_000.0;
-                    discardBacklog();
+                            sourceImage, TILE_SIZE, imageFilter, sink, mode) / 1_000_000.0;
+                }
+                // Cheap correctness check on a timing run: if the two modes ever disagreed on
+                // how many tiles they produced, the speedup number would be comparing
+                // different amounts of work.
+                long expected = (long) (WARMUP_RUNS + MEASURED_RUNS)
+                        * Math.ceilDiv(sourceImage.getWidth(), TILE_SIZE)
+                        * Math.ceilDiv(sourceImage.getHeight(), TILE_SIZE);
+                if (sink.count() != expected) {
+                    logLine(String.format("WARNING: %s produced %,d tiles, expected %,d",
+                            mode.getLabel(), sink.count(), expected));
                 }
                 return timings;
-            }
-
-            /**
-             * Drops tiles the consumer has not drawn yet. Without this the queue accumulates
-             * tens of thousands of images across runs, and the resulting GC pressure would
-             * itself distort the measurements.
-             */
-            private void discardBacklog(){
-                Platform.runLater(canvasView::clear);
-                try {
-                    Thread.sleep(120);
-                } catch (InterruptedException ex) {
-                    Thread.currentThread().interrupt();
-                }
             }
 
             private void report(ProcessingMode mode, int threads, double[] timings){
@@ -328,6 +347,32 @@ public class HelloApplication extends Application {
             resultsLog.appendText(line + System.lineSeparator());
         } else {
             Platform.runLater(() -> resultsLog.appendText(line + System.lineSeparator()));
+        }
+    }
+
+    /**
+     * A {@link TileSink} that does nothing but count, for measurement runs.
+     *
+     * <p>It exists so the benchmark has a consumer that can never be the bottleneck. It also
+     * skips the {@code SwingFXUtils.toFXImage} conversion the canvas sink performs, so what is
+     * timed is tiling and filtering — the part the thread pool actually parallelises.
+     *
+     * <p>The counter is an {@link AtomicLong} rather than a plain {@code long} because in
+     * asynchronous mode every pool worker increments it concurrently. {@code count++} is a
+     * read-modify-write, not an atomic operation, so with a plain field the benchmark would
+     * lose updates and under-report — a race in the measuring instrument rather than in the
+     * thing being measured, which is the easiest kind to overlook.
+     */
+    private static final class CountingSink implements TileSink {
+        private final AtomicLong tiles = new AtomicLong();
+
+        @Override
+        public void accept(ImageData tile){
+            tiles.incrementAndGet();
+        }
+
+        long count(){
+            return tiles.get();
         }
     }
 

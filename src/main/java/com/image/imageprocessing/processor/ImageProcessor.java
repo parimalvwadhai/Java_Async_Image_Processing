@@ -1,8 +1,8 @@
 package com.image.imageprocessing.processor;
 
 import com.image.imageprocessing.filter.ImageFilter;
-import com.image.imageprocessing.image.DrawMultipleImagesOnCanvas;
 import com.image.imageprocessing.image.ImageData;
+import com.image.imageprocessing.image.TileSink;
 
 import java.awt.image.BufferedImage;
 import java.util.ArrayList;
@@ -44,10 +44,13 @@ public class ImageProcessor {
      * @param num tile size in pixels. It need not divide the image dimensions evenly — the
      *            grid is sized by ceiling division and the tiles along the right and bottom
      *            edges are clamped to whatever remains, so every pixel is covered exactly once
+     * @param drawFn where finished tiles are published. Declared as the {@link TileSink}
+     *               interface rather than the canvas class, so this engine has no dependency
+     *               on JavaFX and the same code path serves the UI, the benchmark, and the tests
      * @return elapsed wall-clock time in nanoseconds
      */
     public long processImage(BufferedImage image, int num, ImageFilter imageFilter,
-                             DrawMultipleImagesOnCanvas drawFn, ProcessingMode mode){
+                             TileSink drawFn, ProcessingMode mode){
         long startedAt = System.nanoTime();
         switch (mode) {
             case SYNCHRONOUS  -> processSequentially(image, num, imageFilter, drawFn);
@@ -62,7 +65,7 @@ public class ImageProcessor {
      * {@code addImageToQueue} — so the two timings differ only by parallelism.
      */
     private void processSequentially(BufferedImage image, int num, ImageFilter imageFilter,
-                                     DrawMultipleImagesOnCanvas drawFn){
+                                     TileSink drawFn){
         int columns = Math.ceilDiv(image.getWidth(), num);
         int rows = Math.ceilDiv(image.getHeight(), num);
 
@@ -77,7 +80,7 @@ public class ImageProcessor {
 
     /** Parallel path: one task per tile across the pool, then await them all. */
     private void processInParallel(BufferedImage image, int num, ImageFilter imageFilter,
-                                   DrawMultipleImagesOnCanvas drawFn){
+                                   TileSink drawFn){
         int columns = Math.ceilDiv(image.getWidth(), num);
         int rows = Math.ceilDiv(image.getHeight(), num);
 
@@ -138,10 +141,10 @@ public class ImageProcessor {
      * edge tiles are smaller.
      */
     private ImageData filterAndPublish(BufferedImage tile, int x, int y, ImageFilter imageFilter,
-                                       DrawMultipleImagesOnCanvas drawFn){
+                                       TileSink drawFn){
         BufferedImage result = imageFilter.filter(tile);
         ImageData imageData = new ImageData(result, x, y, tile.getWidth(), tile.getHeight());
-        drawFn.addImageToQueue(imageData);
+        drawFn.accept(imageData);
         return imageData;
     }
 
