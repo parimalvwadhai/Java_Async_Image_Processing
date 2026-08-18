@@ -36,3 +36,7 @@ build/
 
 ### Mac OS ###
 .DS_Store
+
+# Claude Code local context & settings
+CLAUDE.md
+.claude/
