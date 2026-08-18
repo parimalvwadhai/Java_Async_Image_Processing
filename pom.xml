@@ -140,7 +140,7 @@
                         <id>default-cli</id>
                         <configuration>
                             <mainClass>
-                                com.converter.imageprocessorapp/com.my.app.HelloApplication
+                                com.image.imageprocessing/com.image.imageprocessing.HelloApplication
                             </mainClass>
                             <launcher>app</launcher>
                             <jlinkZipName>app</jlinkZipName>

@@ -40,3 +40,6 @@ build/
 # Claude Code local context & settings
 CLAUDE.md
 .claude/
+
+# Personal notes / interview prep — not published to GitHub
+plan.md
